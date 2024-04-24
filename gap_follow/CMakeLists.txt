@@ -20,7 +20,13 @@ foreach(PACKAGE
   nav_msgs
   ackermann_msgs
   sensor_msgs
-  std_msgs)
+  std_msgs
+  visualization_msgs
+  tf2
+  tf2_msgs
+  tf2_sensor_msgs
+  tf2_ros
+  tf2_geometry_msgs)
 
   find_package(${PACKAGE} REQUIRED)
 
@@ -32,7 +38,8 @@ include_directories(include)
 # Create Cpp executable
 add_executable(reactive_node src/reactive_node.cpp)
 ament_target_dependencies(reactive_node 
-  rclcpp geometry_msgs ackermann_msgs nav_msgs sensor_msgs std_msgs
+  rclcpp geometry_msgs ackermann_msgs nav_msgs sensor_msgs std_msgs visualization_msgs
+  tf2 tf2_ros tf2_geometry_msgs
 )
 
 # Install Cpp executables
