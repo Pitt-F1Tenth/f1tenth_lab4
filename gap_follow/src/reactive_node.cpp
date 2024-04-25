@@ -1,4 +1,6 @@
 #include "rclcpp/rclcpp.hpp"
+#include <math.h>
+#include <cmath>
 #include <string>
 #include <vector>
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -38,6 +40,9 @@ public:
         gap_lookahead_ = this->get_parameter("gap_lookahead").as_double();        
         this->declare_parameter("obstacle_buffer", 0.25);
         obstacle_buffer_ = this->get_parameter("obstacle_buffer").as_double();
+        this->declare_parameter("fov", 180.);
+        fov_ = this->get_parameter("fov").as_double();
+        fov_ *= M_PI / 180.;
 
         param_timer_ = this->create_wall_timer(std::chrono::milliseconds(100),
             std::bind(&ReactiveFollowGap::paramTimer, this));
@@ -54,6 +59,8 @@ public:
         kernel_size_ = this->get_parameter("kernel_size").as_int();
         gap_lookahead_ = this->get_parameter("gap_lookahead").as_double();
         obstacle_buffer_ = this->get_parameter("obstacle_buffer").as_double();
+        fov_ = this->get_parameter("fov").as_double();
+        fov_ *= M_PI / 180.;
     }
 
     void tfTimer() {
@@ -75,6 +82,7 @@ private:
     int kernel_size_;
     double gap_lookahead_;
     double obstacle_buffer_;
+    double fov_;
 
     nav_msgs::msg::Odometry curr_odom_;
 
@@ -146,8 +154,10 @@ private:
     void find_max_gap(std::vector<float> ranges, std::pair<int, int>& gap_idxs) {   
         int max_gap = 0;
         int gap = 0;
-        int gap_start_idx = 0;
         bool new_gap = true;
+
+        // Relative start idx, to the ranges vector
+        int gap_start_idx = 0;
         
         for (std::size_t i = 0; i < ranges.size(); ++i) {
             // Definition of gap: Values further away than lookahead point
@@ -178,54 +188,59 @@ private:
             }
         }
         
-        return;
+        return; // Pass gap_idxs back by reference, relative to the ranges vector
     }
 
     int get_best_point(std::vector<float> ranges, std::pair<int, int> idxs)
     {   
-        // Start_i & end_i are start and end indicies of max-gap range, respectively
-        // Return index of best point in ranges
-	    // Naive: Choose the furthest point within ranges and go there
+        // idxs is relative to ranges vector
         double max = 0;
-        // int best_point = idxs.first; // 
         int best_point = (idxs.first + idxs.second)/2;
-        for (int i = idxs.first; i <= idxs.second; ++i) {
-            if (ranges[i] > max) {
-                best_point = i;
-                max = ranges[i];
-            }
-        }
+        // for (int i = idxs.first; i <= idxs.second; ++i) {
+        //     if (ranges[i] > max) {
+        //         best_point = i;
+        //         max = ranges[i];
+        //     }
+        // }
         return best_point;
     }
 
     void scanCB(const sensor_msgs::msg::LaserScan::ConstSharedPtr msg) 
     {   
-        std::vector<float> scans = msg->ranges;
-        // Process each LiDAR scan as per the Follow Gap algorithm & publish an AckermannDriveStamped Message
+        double current_fov = msg->angle_max - msg->angle_min;
+        double crop_fov = fov_;
 
-        /// TODO:
+        // Calculate the new start/end index of the FOV
+        int crop_start_idx = static_cast<int>((current_fov - crop_fov) / (2 * msg->angle_increment));
+        int crop_end_idx = static_cast<int>(crop_fov / msg->angle_increment) + crop_start_idx;
+
+        // Extract the scans within the new FOV
+        std::vector<float> scans = msg->ranges;
+        std::vector<float> cropped_scans(scans.begin() + crop_start_idx, scans.begin() + crop_end_idx);
+        
         // Process
-        preprocess_lidar(scans);
+        // preprocess_lidar(cropped_scans);
 
         // Find max gap
         std::pair<int, int> gap;
-        find_max_gap(scans, gap);
+        find_max_gap(cropped_scans, gap);
 
-        int gap_idx = get_best_point(scans, gap);
-        RCLCPP_INFO(this->get_logger(), "best idx: %d", gap_idx);
+        // Find target
+        int gap_idx = get_best_point(cropped_scans, gap);
+        double target_angle = msg->angle_min + (gap_idx + crop_start_idx) * msg->angle_increment;
 
         // Command
-        double target_angle = msg->angle_min + gap_idx * msg->angle_increment;
         ackermann_msgs::msg::AckermannDriveStamped command;
         command.drive.steering_angle = target_angle;
-        command.drive.speed = 0.5;
+        command.drive.speed = 0.25*cropped_scans[gap_idx];
         command.header.stamp = this->get_clock()->now();
         drive_pub_->publish(command);
 
+        // Visualization
         // Find target point (Trim to threshold distance)
         tf2::Vector3 target_point;
         tf2::Vector3 target_transformed;
-        double target_range = msg->ranges[gap_idx];
+        double target_range = cropped_scans[gap_idx];
         if (target_range > gap_lookahead_) {
             target_range = gap_lookahead_;
         }
@@ -233,7 +248,6 @@ private:
         target_point[1] = target_range * std::sin(target_angle);
         target_point[2] = 0.;
 
-        // tf2::doTransform(target_point, target_transformed, lidar_transform_);
         tf2::Transform l_trans;
         tf2::fromMsg(lidar_transform_.transform, l_trans);
         target_transformed = l_trans.getBasis() * target_point;
@@ -243,13 +257,30 @@ private:
         target_pose.position.y = target_transformed[1];
         target_pose.position.z = target_transformed[2];
 
-        // Visualization
         // Gap target marker
+        markerViz(target_pose);
+        
+        // Gap visualization
+        sensor_msgs::msg::LaserScan gap_scan = *msg;
+        gap_scan.header.stamp = this->get_clock()->now();
+        gap_scan.header.frame_id = target_frame_.c_str();
+        gap_scan.ranges = cropped_scans;
+        gap_scan.angle_min = msg->angle_min + crop_start_idx * msg->angle_increment;
+        gap_scan.angle_min = msg->angle_max - crop_end_idx * msg->angle_increment;
+        gap_pub_->publish(gap_scan);
+
+    }
+
+    void odomCB(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg) {
+        curr_odom_ = *odom_msg;
+    }
+
+    void markerViz(geometry_msgs::msg::Pose pose) {
         visualization_msgs::msg::Marker marker;
         marker.header.stamp = this->get_clock()->now();
         marker.header.frame_id = target_frame_.c_str();
         marker.type = 2;
-        marker.pose = target_pose;
+        marker.pose = pose;
         geometry_msgs::msg::Vector3 scale;
         scale.x = 0.25;
         scale.y = 0.25;
@@ -262,18 +293,7 @@ private:
         color.a = 1.;
         marker.color = color;
         viz_pub_->publish(marker);
-
-        // Gap visualization
-        sensor_msgs::msg::LaserScan scan = *msg;
-        scan.header.stamp = this->get_clock()->now();
-        scan.header.frame_id = target_frame_.c_str();
-        scan.ranges = scans;
-        gap_pub_->publish(scan);
-
-    }
-
-    void odomCB(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg) {
-        curr_odom_ = *odom_msg;
+        return;
     }
 
 };
