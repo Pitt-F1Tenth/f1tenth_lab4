@@ -230,9 +230,20 @@ private:
         double target_angle = msg->angle_min + (gap_idx + crop_start_idx) * msg->angle_increment;
 
         // Command
+        double speed = 0.;
+        if (target_angle < (2. * M_PI/180.)) {
+            speed = 1.2;
+        } else if (target_angle < (5. * M_PI/180.)) {
+            speed = 1.0;
+        } else if (target_angle < (10. * M_PI/180.)) {
+            speed = 0.9;
+        } else {
+            speed = 0.8;
+        }
+
         ackermann_msgs::msg::AckermannDriveStamped command;
         command.drive.steering_angle = target_angle;
-        command.drive.speed = 0.25*cropped_scans[gap_idx];
+        command.drive.speed = speed;
         command.header.stamp = this->get_clock()->now();
         drive_pub_->publish(command);
 
